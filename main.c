@@ -35,7 +35,11 @@
 #define ARROW_LEFT  'D'
 #define ARROW_RIGHT 'C'
 
-#define EXTRA_PAUSE_FACTOR 2.5
+#define EXTRA_PAUSE_FACTOR 1.5
+
+#define RAMP_WORDS 5
+#define INITIAL_RAMP_START 0.5
+#define RESUME_RAMP_START  0.8
 
 typedef struct {
     int wpm;
@@ -98,9 +102,9 @@ char waitKeyOrTimeout(const double seconds) {
     if (poll(&pfd, 1, timeoutMs) <= 0) {
         return 0;
     }
-    char c = 0;
-    (void)read(keyboardFd, &c, 1);
-    return c;
+    char byte = 0;
+    (void)read(keyboardFd, &byte, 1);
+    return byte;
 }
 
 typedef enum {
@@ -111,6 +115,7 @@ typedef enum {
     NAV_FORWARD,
     NAV_FASTER,
     NAV_SLOWER,
+    NAV_RESTART,
 } NavEvent;
 
 char readKey(const double seconds) {
@@ -120,9 +125,9 @@ char readKey(const double seconds) {
     }
     const char introducer = waitKeyOrTimeout(0.05);
     if (introducer == KEY_CSI) {
-        const char final = waitKeyOrTimeout(0.05);
-        if (final == ARROW_LEFT)  return 'h';
-        if (final == ARROW_RIGHT) return 'l';
+        const char finalByte = waitKeyOrTimeout(0.05);
+        if (finalByte == ARROW_LEFT)  return 'h';
+        if (finalByte == ARROW_RIGHT) return 'l';
     }
     return 0;
 }
@@ -130,15 +135,16 @@ char readKey(const double seconds) {
 NavEvent waitDuringWord(const double duration) {
     double remaining = duration;
     while (remaining > 0) {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
         const char key = readKey(remaining);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double elapsed = (t1.tv_sec - t0.tv_sec)
-            + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        const double elapsed = (end.tv_sec - start.tv_sec)
+            + (end.tv_nsec - start.tv_nsec) / 1e9;
         remaining -= elapsed;
 
         if (key == 'q' || key == 'Q') return NAV_QUIT;
+        if (key == 'r' || key == 'R') return NAV_RESTART;
         if (key == ' ')               return NAV_TOGGLE_PAUSE;
         if (key == '+' || key == '=') return NAV_FASTER;
         if (key == '-')               return NAV_SLOWER;
@@ -151,6 +157,7 @@ NavEvent waitDuringPause(void) {
         const char key = readKey(-1);
         switch (key) {
             case 'q': case 'Q':       return NAV_QUIT;
+            case 'r': case 'R':       return NAV_RESTART;
             case ' ':                 return NAV_TOGGLE_PAUSE;
             case 'h': case '[':       return NAV_BACK;
             case 'l': case ']':       return NAV_FORWARD;
@@ -160,8 +167,8 @@ NavEvent waitDuringPause(void) {
 }
 
 void restoreTerminal(void) {
-    const char restore[] = SHOW_CURSOR EXIT_ALT_SCREEN;
-    (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+    const char sequence[] = SHOW_CURSOR EXIT_ALT_SCREEN;
+    (void)write(STDOUT_FILENO, sequence, sizeof(sequence) - 1);
     if (termiosSaved) {
         tcsetattr(STDOUT_FILENO, TCSANOW, &originalTermios);
     }
@@ -182,24 +189,24 @@ void printUsage(FILE *out, const char *prog) {
 }
 
 char *readInput(FILE *stream) {
-    size_t cap = INITIAL_BUFFER_SIZE;
-    size_t len = 0;
-    char *buffer = malloc(cap);
+    size_t capacity = INITIAL_BUFFER_SIZE;
+    size_t length = 0;
+    char *buffer = malloc(capacity);
     if (buffer == NULL) {
         return NULL;
     }
     while (1) {
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *tmp = realloc(buffer, cap);
-            if (tmp == NULL) {
+        if (length + 1 >= capacity) {
+            capacity *= 2;
+            char *resized = realloc(buffer, capacity);
+            if (resized == NULL) {
                 free(buffer);
                 return NULL;
             }
-            buffer = tmp;
+            buffer = resized;
         }
-        const size_t bytesRead = fread(buffer + len, 1, cap - len - 1, stream);
-        len += bytesRead;
+        const size_t bytesRead = fread(buffer + length, 1, capacity - length - 1, stream);
+        length += bytesRead;
         if (bytesRead == 0) {
             if (ferror(stream)) {
                 free(buffer);
@@ -208,7 +215,7 @@ char *readInput(FILE *stream) {
             break;
         }
     }
-    buffer[len] = '\0';
+    buffer[length] = '\0';
     return buffer;
 }
 
@@ -257,22 +264,22 @@ int getWordLength(const char *buffer) {
 
 char *previousWordStart(char *text, char *current) {
     if (current <= text) return text;
-    char *p = current;
-    while (p > text && isWordSeparator(*(p - 1))) {
-        p--;
+    char *walker = current;
+    while (walker > text && isWordSeparator(*(walker - 1))) {
+        walker--;
     }
-    while (p > text && !isWordSeparator(*(p - 1))) {
-        p--;
+    while (walker > text && !isWordSeparator(*(walker - 1))) {
+        walker--;
     }
-    return p;
+    return walker;
 }
 
 int utf8SeqLen(const char *p) {
-    const unsigned char b = (unsigned char)*p;
-    if ((b & 0x80) == 0x00) return 1;
-    if ((b & 0xE0) == 0xC0) return 2;
-    if ((b & 0xF0) == 0xE0) return 3;
-    if ((b & 0xF8) == 0xF0) return 4;
+    const unsigned char leadByte = (unsigned char)*p;
+    if ((leadByte & 0x80) == 0x00) return 1;
+    if ((leadByte & 0xE0) == 0xC0) return 2;
+    if ((leadByte & 0xF0) == 0xE0) return 3;
+    if ((leadByte & 0xF8) == 0xF0) return 4;
     return 1;
 }
 
@@ -330,18 +337,18 @@ void printProgressBar(const long consumed, const long total, const int cols) {
 }
 
 void printWordCentered(const char *buffer, const int wordLength, const int cols) {
-    const WordMetrics m = measureWord(buffer, wordLength);
-    int padding = cols / 2 - m.codePoints / 2;
+    const WordMetrics metrics = measureWord(buffer, wordLength);
+    int padding = cols / 2 - metrics.codePoints / 2;
     if (padding < 0) {
         padding = 0;
     }
 
-    const int rest = wordLength - m.middleByteOffset - m.middleByteLength;
+    const int rest = wordLength - metrics.middleByteOffset - metrics.middleByteLength;
     printSpaces(padding);
     printf("%.*s" RED_COLOR "%.*s" RESET_COLOR "%.*s",
-           m.middleByteOffset, buffer,
-           m.middleByteLength, buffer + m.middleByteOffset,
-           rest, buffer + m.middleByteOffset + m.middleByteLength);
+           metrics.middleByteOffset, buffer,
+           metrics.middleByteLength, buffer + metrics.middleByteOffset,
+           rest, buffer + metrics.middleByteOffset + metrics.middleByteLength);
 }
 
 int parseInt(const char *num) {
@@ -362,7 +369,16 @@ int parseInt(const char *num) {
     return result;
 }
 
-double secondsForWPM(const int wpm) {
+int rampedWpm(const int target, const int rampIndex, const double rampStart) {
+    if (rampIndex >= RAMP_WORDS) {
+        return target;
+    }
+    const double progress = (double)rampIndex / RAMP_WORDS;
+    const double factor = rampStart + (1.0 - rampStart) * progress;
+    return (int)(target * factor);
+}
+
+double secondsForWpm(const int wpm) {
     return 60.0 / wpm;
 }
 
@@ -461,8 +477,14 @@ int main(const int argc, char *argv[]) {
     initTerminal();
 
     int wpm = options.wpm;
-    double wordDuration = secondsForWPM(wpm);
-    const long totalBytes = (long)strlen(text);
+    int rampIndex = 0;
+    double rampStart = INITIAL_RAMP_START;
+
+    const char *end = text + strlen(text);
+    while (end > text && isWordSeparator(*(end - 1))) {
+        end--;
+    }
+    const long totalBytes = end - text;
 
     char *cursor = text;
     bool paused = false;
@@ -499,9 +521,9 @@ int main(const int argc, char *argv[]) {
         if (paused) {
             event = waitDuringPause();
         } else {
-            const double duration = needsExtraPause
-                ? wordDuration * EXTRA_PAUSE_FACTOR
-                : wordDuration;
+            const int effectiveWpm = rampedWpm(wpm, rampIndex, rampStart);
+            const double base = secondsForWpm(effectiveWpm);
+            const double duration = needsExtraPause ? base * EXTRA_PAUSE_FACTOR : base;
             event = waitDuringWord(duration);
         }
 
@@ -511,27 +533,32 @@ int main(const int argc, char *argv[]) {
                 break;
             case NAV_TOGGLE_PAUSE:
                 paused = !paused;
-                if (paused) cursor = wordStart;
+                if (paused) {
+                    cursor = wordStart;
+                } else {
+                    rampIndex = 0;
+                    rampStart = RESUME_RAMP_START;
+                }
                 break;
             case NAV_BACK:
                 cursor = previousWordStart(text, wordStart);
                 break;
+            case NAV_RESTART:
+                cursor = text;
+                rampIndex = 0;
+                rampStart = INITIAL_RAMP_START;
+                break;
             case NAV_FASTER:
-                if (wpm + WPM_STEP <= MAX_WPM) {
-                    wpm += WPM_STEP;
-                    wordDuration = secondsForWPM(wpm);
-                }
+                if (wpm + WPM_STEP <= MAX_WPM) wpm += WPM_STEP;
                 cursor = wordStart;
                 break;
             case NAV_SLOWER:
-                if (wpm - WPM_STEP >= MIN_WPM) {
-                    wpm -= WPM_STEP;
-                    wordDuration = secondsForWPM(wpm);
-                }
+                if (wpm - WPM_STEP >= MIN_WPM) wpm -= WPM_STEP;
                 cursor = wordStart;
                 break;
             case NAV_FORWARD:
             case NAV_TIMEOUT:
+                if (rampIndex < RAMP_WORDS) rampIndex++;
                 break;
         }
     }
