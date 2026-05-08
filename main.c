@@ -41,6 +41,8 @@
 #define INITIAL_RAMP_START 0.5
 #define RESUME_RAMP_START  0.8
 
+#define WPM_INDICATOR_WORDS 5
+
 typedef struct {
     int wpm;
     char *path;
@@ -262,6 +264,20 @@ int getWordLength(const char *buffer) {
     return (int)(end - buffer);
 }
 
+int countWords(const char *text) {
+    int count = 0;
+    bool inWord = false;
+    for (const char *walker = text; *walker; walker++) {
+        if (isWordSeparator(*walker)) {
+            inWord = false;
+        } else if (!inWord) {
+            count++;
+            inWord = true;
+        }
+    }
+    return count;
+}
+
 char *previousWordStart(char *text, char *current) {
     if (current <= text) return text;
     char *walker = current;
@@ -313,14 +329,20 @@ void printSpaces(const int count) {
     }
 }
 
-void printProgressBar(const long consumed, const long total, const int cols) {
+void printProgressBar(const long consumed, const long total, const int cols, const int secondsRemaining) {
     if (total <= 0 || cols <= 0) {
         return;
     }
     const int percent = (int)(100 * consumed / total);
-    const int reserved = 7;
+    const int minutes = secondsRemaining / 60;
+    const int seconds = secondsRemaining % 60;
+
+    char tail[32];
+    const int tailLen = snprintf(tail, sizeof(tail), "] %3d%% %d:%02d", percent, minutes, seconds);
+
+    const int reserved = 1 + tailLen;
     if (cols < reserved + 1) {
-        printf("%3d%%", percent);
+        printf("%3d%% %d:%02d", percent, minutes, seconds);
         return;
     }
     const int barWidth = cols - reserved;
@@ -333,7 +355,16 @@ void printProgressBar(const long consumed, const long total, const int cols) {
     for (int i = filled; i < barWidth; i++) {
         putchar(' ');
     }
-    printf("] %3d%%", percent);
+    fputs(tail, stdout);
+}
+
+void printWpmLabel(const int wpm, const int cols, const int row) {
+    char label[32];
+    const int labelLen = snprintf(label, sizeof(label), "%d wpm", wpm);
+    const int pad = cols / 2 > labelLen / 2 ? cols / 2 - labelLen / 2 : 0;
+    moveCursor(row, 1);
+    printSpaces(pad);
+    fputs(label, stdout);
 }
 
 void printWordCentered(const char *buffer, const int wordLength, const int cols) {
@@ -479,12 +510,15 @@ int main(const int argc, char *argv[]) {
     int wpm = options.wpm;
     int rampIndex = 0;
     double rampStart = INITIAL_RAMP_START;
+    int wpmShowCounter = WPM_INDICATOR_WORDS;
 
     const char *end = text + strlen(text);
     while (end > text && isWordSeparator(*(end - 1))) {
         end--;
     }
     const long totalBytes = end - text;
+    const int totalWords = countWords(text);
+    int wordsRead = 0;
 
     char *cursor = text;
     bool paused = false;
@@ -513,8 +547,15 @@ int main(const int argc, char *argv[]) {
         fputs(ERASE_BELOW, stdout);
         printWordCentered(wordStart, wordLength, cols);
 
+        if (wpmShowCounter > 0 && wordRow + 2 < barRow) {
+            printWpmLabel(wpm, cols, wordRow + 2);
+        }
+
+        const int wordsRemaining = totalWords > wordsRead ? totalWords - wordsRead : 0;
+        const int secondsRemaining = (int)(wordsRemaining * 60.0 / wpm);
+
         moveCursor(barRow, 1);
-        printProgressBar(cursor - text, totalBytes, cols);
+        printProgressBar(cursor - text, totalBytes, cols, secondsRemaining);
         fflush(stdout);
 
         NavEvent event;
@@ -542,23 +583,30 @@ int main(const int argc, char *argv[]) {
                 break;
             case NAV_BACK:
                 cursor = previousWordStart(text, wordStart);
+                if (wordsRead > 0) wordsRead--;
                 break;
             case NAV_RESTART:
                 cursor = text;
                 rampIndex = 0;
                 rampStart = INITIAL_RAMP_START;
+                wordsRead = 0;
+                wpmShowCounter = WPM_INDICATOR_WORDS;
                 break;
             case NAV_FASTER:
                 if (wpm + WPM_STEP <= MAX_WPM) wpm += WPM_STEP;
                 cursor = wordStart;
+                wpmShowCounter = WPM_INDICATOR_WORDS;
                 break;
             case NAV_SLOWER:
                 if (wpm - WPM_STEP >= MIN_WPM) wpm -= WPM_STEP;
                 cursor = wordStart;
+                wpmShowCounter = WPM_INDICATOR_WORDS;
                 break;
             case NAV_FORWARD:
             case NAV_TIMEOUT:
                 if (rampIndex < RAMP_WORDS) rampIndex++;
+                if (wpmShowCounter > 0) wpmShowCounter--;
+                wordsRead++;
                 break;
         }
     }
