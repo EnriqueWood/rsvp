@@ -1,37 +1,56 @@
 #include <getopt.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
-#include <signal.h>
-#include <stdbool.h>
 
 #define WPM 350
 #define DEFAULT_COLS 80
 #define INITIAL_BUFFER_SIZE 4096
 #define RED_COLOR "\033[31m"
-#define BLACK_COLOR "\033[0m"
+#define RESET_COLOR "\033[0m"
 #define HIDE_CURSOR "\033[?25l"
 #define SHOW_CURSOR "\033[?25h"
 
 #define CURSOR_UP "\033[A"
 #define ERASE_LINE "\r\033[J"
 
-#define EXTRA_PAUSE_MULTIPLIER 2.5
+#define EXTRA_PAUSE_FACTOR 2.5
 
 typedef struct {
     int wpm;
     char *path;
 } CliOptions;
 
+typedef struct {
+    int codePoints;
+    int middleByteOffset;
+    int middleByteLength;
+} WordMetrics;
+
+static volatile sig_atomic_t terminalResized = 1;
+
 void restoreCursor(void) {
-    printf(SHOW_CURSOR);
-    fflush(stdout);
+    const char show[] = SHOW_CURSOR;
+    (void)write(STDOUT_FILENO, show, sizeof(show) - 1);
 }
 
-void onSignal(const int signal) {
+void onSignal(const int signo) {
     restoreCursor();
-    _exit(128 + signal);
+    _exit(128 + signo);
+}
+
+void onWindowChange(const int signo) {
+    (void)signo;
+    terminalResized = 1;
+}
+
+void printUsage(FILE *out, const char *prog) {
+    fprintf(out, "usage: %s [-w|--wpm wpm] [-f|--file file] [-h|--help]\n", prog);
 }
 
 char *readInput(FILE *stream) {
@@ -51,9 +70,13 @@ char *readInput(FILE *stream) {
             }
             buffer = tmp;
         }
-        size_t n = fread(buffer + len, 1, cap - len - 1, stream);
+        const size_t n = fread(buffer + len, 1, cap - len - 1, stream);
         len += n;
         if (n == 0) {
+            if (ferror(stream)) {
+                free(buffer);
+                return NULL;
+            }
             break;
         }
     }
@@ -61,85 +84,158 @@ char *readInput(FILE *stream) {
     return buffer;
 }
 
-int terminalCols(void) {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-        return ws.ws_col;
+int currentCols(void) {
+    static int cached = DEFAULT_COLS;
+    if (terminalResized) {
+        terminalResized = 0;
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+            cached = ws.ws_col;
+        }
     }
-    return DEFAULT_COLS;
+    return cached;
+}
+
+bool isWordSeparator(const char c) {
+    return c == ' ' || c == '\t' || c == '\n';
 }
 
 int getWordLength(const char *buffer) {
     int wordLength = 0;
-    char letter = ' ';
-    while ((letter = buffer[wordLength]) != '\0' && letter != '.' && letter != ' ' && letter != '\n') {
+    char letter;
+    while ((letter = buffer[wordLength]) != '\0' && !isWordSeparator(letter)) {
         wordLength++;
     }
     return wordLength;
 }
 
-int printPadding(const int center, const int middle) {
-    int padding = center - middle;
+int utf8SeqLen(const unsigned char b) {
+    if ((b & 0x80) == 0x00) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+WordMetrics measureWord(const char *buffer, const int byteLength) {
+    int codePoints = 0;
+    int i = 0;
+    while (i < byteLength) {
+        i += utf8SeqLen((unsigned char)buffer[i]);
+        codePoints++;
+    }
+
+    const int target = codePoints / 2;
+    int byteOffset = 0;
+    int byteLen = 0;
+    int j = 0;
+    int cp = 0;
+    while (j < byteLength) {
+        int seqLen = utf8SeqLen((unsigned char)buffer[j]);
+        if (j + seqLen > byteLength) {
+            seqLen = byteLength - j;
+        }
+        if (cp == target) {
+            byteOffset = j;
+            byteLen = seqLen;
+            break;
+        }
+        j += seqLen;
+        cp++;
+    }
+    return (WordMetrics){codePoints, byteOffset, byteLen};
+}
+
+int linesNeeded(const int totalChars, const int cols) {
+    if (totalChars <= 0 || cols <= 0) {
+        return 1;
+    }
+    return (totalChars + cols - 1) / cols;
+}
+
+void printSpaces(const int count) {
+    for (int i = 0; i < count; i++) {
+        putchar(' ');
+    }
+}
+
+int printWordCentered(const char *buffer, const int wordLength, const int cols) {
+    const WordMetrics m = measureWord(buffer, wordLength);
+    int padding = cols / 2 - m.codePoints / 2;
     if (padding < 0) {
         padding = 0;
     }
-    for (int i = 0; i < padding; i++) {
-        printf(" ");
-    }
-    return padding;
-}
 
-char *printNextWord(char *buffer, int *linesUsed) {
-    const int wordLength = getWordLength(buffer);
-
-    const int cols = terminalCols();
-    const int center = cols / 2;
-    const int middle = wordLength / 2;
-    const int padding = printPadding(center, middle);
-    for (int i = 0; i < wordLength; i++) {
-        printf(i == middle ? RED_COLOR "%c" BLACK_COLOR : "%c", buffer[i]);
-    }
-    const int totalChars = padding + wordLength;
-    *linesUsed = totalChars > 0 ? (totalChars + cols - 1) / cols : 1;
-
-    buffer = &buffer[wordLength];
-    fflush(stdout);
-    return buffer;
+    const int rest = wordLength - m.middleByteOffset - m.middleByteLength;
+    printSpaces(padding);
+    printf("%.*s" RED_COLOR "%.*s" RESET_COLOR "%.*s",
+           m.middleByteOffset, buffer,
+           m.middleByteLength, buffer + m.middleByteOffset,
+           rest, buffer + m.middleByteOffset + m.middleByteLength);
+    return padding + m.codePoints;
 }
 
 int parseInt(const char *num) {
+    if (num[0] == '\0') {
+        return -1;
+    }
     int result = 0;
     for (int i = 0; num[i] != '\0'; i++) {
         if (num[i] < '0' || num[i] > '9') {
             return -1;
         }
-        result = result * 10 + (num[i] - '0');
+        const int digit = num[i] - '0';
+        if (result > (INT_MAX - digit) / 10) {
+            return -1;
+        }
+        result = result * 10 + digit;
     }
     return result;
 }
 
-void limitToWPM(const int wpm) {
-    usleep(60 * 1000000 / wpm);
+double secondsForWPM(const int wpm) {
+    return 60.0 / wpm;
+}
+
+void sleepSeconds(const double seconds) {
+    if (seconds <= 0) {
+        return;
+    }
+    const long ns = (long)(seconds * 1e9);
+    const struct timespec ts = {
+        .tv_sec = ns / 1000000000L,
+        .tv_nsec = ns % 1000000000L,
+    };
+    nanosleep(&ts, NULL);
 }
 
 void initTerminal(void) {
     atexit(restoreCursor);
-    signal(SIGINT, onSignal);
-    signal(SIGTERM, onSignal);
-    printf(HIDE_CURSOR);
+
+    struct sigaction exitAction = {0};
+    exitAction.sa_handler = onSignal;
+    sigemptyset(&exitAction.sa_mask);
+    sigaction(SIGINT, &exitAction, NULL);
+    sigaction(SIGTERM, &exitAction, NULL);
+
+    struct sigaction winchAction = {0};
+    winchAction.sa_handler = onWindowChange;
+    sigemptyset(&winchAction.sa_mask);
+    winchAction.sa_flags = SA_RESTART;
+    sigaction(SIGWINCH, &winchAction, NULL);
+
+    fputs(HIDE_CURSOR, stdout);
 }
 
 void cleanDisplay(const int linesUsed) {
     for (int i = 0; i < linesUsed - 1; i++) {
-        printf(CURSOR_UP);
+        fputs(CURSOR_UP, stdout);
     }
-    printf(ERASE_LINE);
+    fputs(ERASE_LINE, stdout);
 }
 
-int isExtraPauseCharacter(const char lastChar) {
-    const char followingChar = *(&lastChar + 1);
-    return (lastChar == '.' || lastChar == '!' || lastChar == '?') &&
-           (followingChar == ' ' || followingChar == '\n' || followingChar == '\0');
+bool isSentenceEnd(const char c) {
+    return c == '.' || c == '!' || c == '?';
 }
 
 CliOptions parseOptions(const int argc, char **argv) {
@@ -149,13 +245,14 @@ CliOptions parseOptions(const int argc, char **argv) {
     };
 
     static struct option longOptions[] = {
-        {"wpm", required_argument, 0, 'w'},
-        {"file", required_argument, 0, 'f'},
-        {0, 0, 0, 0}
+        {"wpm", required_argument, NULL, 'w'},
+        {"file", required_argument, NULL, 'f'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:f:", longOptions, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "w:f:h", longOptions, NULL)) != -1) {
         switch (opt) {
             case 'w':
                 options.wpm = parseInt(optarg);
@@ -167,8 +264,11 @@ CliOptions parseOptions(const int argc, char **argv) {
             case 'f':
                 options.path = optarg;
                 break;
+            case 'h':
+                printUsage(stdout, argv[0]);
+                exit(0);
             default:
-                fprintf(stderr, "usage: %s [-w|--wpm wpm] [-f|--file file]\n", argv[0]);
+                printUsage(stderr, argv[0]);
                 exit(1);
         }
     }
@@ -188,29 +288,42 @@ int main(const int argc, char *argv[]) {
         }
     }
 
-    char *buffer = readInput(stream);
+    char *text = readInput(stream);
     if (stream != stdin) {
         fclose(stream);
     }
-    if (buffer == NULL) {
-        fprintf(stderr, "out of memory\n");
+    if (text == NULL) {
+        fprintf(stderr, "failed to read input\n");
         return 1;
     }
 
     initTerminal();
 
+    const double wordDuration = secondsForWPM(options.wpm);
+
+    char *cursor = text;
     int linesUsed = 1;
-    while (buffer[0] != '\0') {
+    while (cursor[0] != '\0') {
+        while (isWordSeparator(cursor[0])) {
+            cursor = &cursor[1];
+        }
+        if (cursor[0] == '\0') {
+            break;
+        }
+
+        const int wordLength = getWordLength(cursor);
+        const bool needsExtraPause = isSentenceEnd(cursor[wordLength - 1]);
+        const int cols = currentCols();
+
         cleanDisplay(linesUsed);
-        buffer = printNextWord(buffer, &linesUsed);
-        while (buffer[0] == ' ' || buffer[0] == '\n' || isExtraPauseCharacter(buffer[0])) {
-            buffer = &buffer[1];
-        }
-        bool needsExtraPause = false;
-        if (isExtraPauseCharacter(*(buffer - 2))) {
-            needsExtraPause = true;
-        }
-        limitToWPM(needsExtraPause ? options.wpm / EXTRA_PAUSE_MULTIPLIER : options.wpm);
+        const int totalChars = printWordCentered(cursor, wordLength, cols);
+        linesUsed = linesNeeded(totalChars, cols);
+        fflush(stdout);
+
+        cursor = &cursor[wordLength];
+        sleepSeconds(needsExtraPause ? wordDuration * EXTRA_PAUSE_FACTOR : wordDuration);
     }
+
+    free(text);
     return 0;
 }
