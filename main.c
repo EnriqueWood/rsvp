@@ -1,24 +1,31 @@
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #define WPM 350
 #define DEFAULT_COLS 80
+#define DEFAULT_ROWS 24
 #define INITIAL_BUFFER_SIZE 4096
-#define RED_COLOR "\033[31m"
+
+#define ENTER_ALT_SCREEN "\033[?1049h"
+#define EXIT_ALT_SCREEN  "\033[?1049l"
+#define CLEAR_SCREEN     "\033[2J\033[H"
+#define ERASE_BELOW      "\033[J"
+
+#define RED_COLOR   "\033[31m"
 #define RESET_COLOR "\033[0m"
 #define HIDE_CURSOR "\033[?25l"
 #define SHOW_CURSOR "\033[?25h"
-
-#define CURSOR_UP "\033[A"
-#define ERASE_LINE "\r\033[J"
 
 #define EXTRA_PAUSE_FACTOR 2.5
 
@@ -35,13 +42,32 @@ typedef struct {
 
 static volatile sig_atomic_t terminalResized = 1;
 
-void restoreCursor(void) {
-    const char show[] = SHOW_CURSOR;
-    (void)write(STDOUT_FILENO, show, sizeof(show) - 1);
+static struct termios originalTermios;
+static bool termiosSaved = false;
+
+void disableEcho(void) {
+    if (!isatty(STDOUT_FILENO)) {
+        return;
+    }
+    if (tcgetattr(STDOUT_FILENO, &originalTermios) != 0) {
+        return;
+    }
+    termiosSaved = true;
+    struct termios silenced = originalTermios;
+    silenced.c_lflag &= ~ECHO;
+    tcsetattr(STDOUT_FILENO, TCSANOW, &silenced);
+}
+
+void restoreTerminal(void) {
+    const char restore[] = SHOW_CURSOR EXIT_ALT_SCREEN;
+    (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+    if (termiosSaved) {
+        tcsetattr(STDOUT_FILENO, TCSANOW, &originalTermios);
+    }
 }
 
 void onSignal(const int signo) {
-    restoreCursor();
+    restoreTerminal();
     _exit(128 + signo);
 }
 
@@ -71,9 +97,9 @@ char *readInput(FILE *stream) {
             }
             buffer = tmp;
         }
-        const size_t n = fread(buffer + len, 1, cap - len - 1, stream);
-        len += n;
-        if (n == 0) {
+        const size_t bytesRead = fread(buffer + len, 1, cap - len - 1, stream);
+        len += bytesRead;
+        if (bytesRead == 0) {
             if (ferror(stream)) {
                 free(buffer);
                 return NULL;
@@ -85,16 +111,35 @@ char *readInput(FILE *stream) {
     return buffer;
 }
 
-int currentCols(void) {
-    static int cached = DEFAULT_COLS;
-    if (terminalResized) {
-        terminalResized = 0;
-        struct winsize ws;
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-            cached = ws.ws_col;
-        }
+static struct {
+    int rows;
+    int cols;
+} terminalSize = {.rows = DEFAULT_ROWS, .cols = DEFAULT_COLS};
+
+void refreshTerminalSize(void) {
+    if (!terminalResized) {
+        return;
     }
-    return cached;
+    terminalResized = 0;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0) terminalSize.cols = ws.ws_col;
+        if (ws.ws_row > 0) terminalSize.rows = ws.ws_row;
+    }
+}
+
+int currentCols(void) {
+    refreshTerminalSize();
+    return terminalSize.cols;
+}
+
+int currentRows(void) {
+    refreshTerminalSize();
+    return terminalSize.rows;
+}
+
+void moveCursor(const int row, const int col) {
+    printf("\033[%d;%dH", row, col);
 }
 
 bool isWordSeparator(const char c) {
@@ -142,13 +187,6 @@ WordMetrics measureWord(const char *buffer, const int byteLength) {
     };
 }
 
-int linesNeeded(const int totalChars, const int cols) {
-    if (totalChars <= 0 || cols <= 0) {
-        return 1;
-    }
-    return (totalChars + cols - 1) / cols;
-}
-
 void printSpaces(const int count) {
     for (int i = 0; i < count; i++) {
         putchar(' ');
@@ -178,7 +216,7 @@ void printProgressBar(const long consumed, const long total, const int cols) {
     printf("] %3d%%", percent);
 }
 
-int printWordCentered(const char *buffer, const int wordLength, const int cols) {
+void printWordCentered(const char *buffer, const int wordLength, const int cols) {
     const WordMetrics m = measureWord(buffer, wordLength);
     int padding = cols / 2 - m.codePoints / 2;
     if (padding < 0) {
@@ -191,7 +229,6 @@ int printWordCentered(const char *buffer, const int wordLength, const int cols) 
            m.middleByteOffset, buffer,
            m.middleByteLength, buffer + m.middleByteOffset,
            rest, buffer + m.middleByteOffset + m.middleByteLength);
-    return padding + m.codePoints;
 }
 
 int parseInt(const char *num) {
@@ -237,18 +274,12 @@ void installSignalHandler(const int signo, void (*handler)(int), const int flags
 }
 
 void initTerminal(void) {
-    atexit(restoreCursor);
+    atexit(restoreTerminal);
     installSignalHandler(SIGINT, onSignal, 0);
     installSignalHandler(SIGTERM, onSignal, 0);
     installSignalHandler(SIGWINCH, onWindowChange, SA_RESTART);
-    fputs(HIDE_CURSOR, stdout);
-}
-
-void cleanDisplay(const int linesUsed) {
-    for (int i = 0; i < linesUsed - 1; i++) {
-        fputs(CURSOR_UP, stdout);
-    }
-    fputs(ERASE_LINE, stdout);
+    disableEcho();
+    fputs(ENTER_ALT_SCREEN HIDE_CURSOR CLEAR_SCREEN, stdout);
 }
 
 bool isSentenceEnd(const char c) {
@@ -331,7 +362,6 @@ int main(const int argc, char *argv[]) {
     const long totalBytes = (long)strlen(text);
 
     char *cursor = text;
-    int linesUsed = 1;
     while (*cursor) {
         while (isWordSeparator(*cursor)) {
             cursor++;
@@ -343,16 +373,21 @@ int main(const int argc, char *argv[]) {
         const int wordLength = getWordLength(cursor);
         const bool needsExtraPause = isSentenceEnd(cursor[wordLength - 1])
             || nextIsParagraphBreak(cursor + wordLength);
-        const int cols = currentCols();
 
-        cleanDisplay(linesUsed);
-        const int totalChars = printWordCentered(cursor, wordLength, cols);
-        const int wordLines = linesNeeded(totalChars, cols);
-
+        const char *wordStart = cursor;
         cursor += wordLength;
-        putchar('\n');
+
+        const int cols = currentCols();
+        const int rows = currentRows();
+        const int wordRow = rows / 2 > 0 ? rows / 2 : 1;
+        const int barRow = rows > 0 ? rows : 1;
+
+        moveCursor(wordRow, 1);
+        fputs(ERASE_BELOW, stdout);
+        printWordCentered(wordStart, wordLength, cols);
+
+        moveCursor(barRow, 1);
         printProgressBar(cursor - text, totalBytes, cols);
-        linesUsed = wordLines + 1;
         fflush(stdout);
 
         sleepSeconds(needsExtraPause ? wordDuration * EXTRA_PAUSE_FACTOR : wordDuration);
