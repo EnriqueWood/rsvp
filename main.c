@@ -13,6 +13,9 @@
 #include <unistd.h>
 
 #define WPM 350
+#define MIN_WPM 50
+#define MAX_WPM 2000
+#define WPM_STEP 25
 #define DEFAULT_COLS 80
 #define DEFAULT_ROWS 24
 #define INITIAL_BUFFER_SIZE 4096
@@ -26,6 +29,11 @@
 #define RESET_COLOR "\033[0m"
 #define HIDE_CURSOR "\033[?25l"
 #define SHOW_CURSOR "\033[?25h"
+
+#define KEY_ESC     '\033'
+#define KEY_CSI     '['
+#define ARROW_LEFT  'D'
+#define ARROW_RIGHT 'C'
 
 #define EXTRA_PAUSE_FACTOR 2.5
 
@@ -44,8 +52,21 @@ static volatile sig_atomic_t terminalResized = 1;
 
 static struct termios originalTermios;
 static bool termiosSaved = false;
+static int keyboardFd = -1;
 
-void disableEcho(void) {
+void sleepSeconds(const double seconds) {
+    if (seconds <= 0) {
+        return;
+    }
+    const time_t wholeSecs = (time_t)seconds;
+    const struct timespec ts = {
+        .tv_sec = wholeSecs,
+        .tv_nsec = (long)((seconds - wholeSecs) * 1e9),
+    };
+    nanosleep(&ts, NULL);
+}
+
+void prepareTerminalInput(void) {
     if (!isatty(STDOUT_FILENO)) {
         return;
     }
@@ -53,9 +74,89 @@ void disableEcho(void) {
         return;
     }
     termiosSaved = true;
-    struct termios silenced = originalTermios;
-    silenced.c_lflag &= ~ECHO;
-    tcsetattr(STDOUT_FILENO, TCSANOW, &silenced);
+    struct termios mode = originalTermios;
+    mode.c_lflag &= ~(ECHO | ICANON);
+    mode.c_cc[VMIN] = 0;
+    mode.c_cc[VTIME] = 0;
+    tcsetattr(STDOUT_FILENO, TCSANOW, &mode);
+}
+
+void openKeyboard(void) {
+    if (!isatty(STDOUT_FILENO)) {
+        return;
+    }
+    keyboardFd = open("/dev/tty", O_RDONLY);
+}
+
+char waitKeyOrTimeout(const double seconds) {
+    if (keyboardFd < 0) {
+        if (seconds > 0) sleepSeconds(seconds);
+        return 0;
+    }
+    struct pollfd pfd = {.fd = keyboardFd, .events = POLLIN};
+    const int timeoutMs = seconds < 0 ? -1 : (int)(seconds * 1000);
+    if (poll(&pfd, 1, timeoutMs) <= 0) {
+        return 0;
+    }
+    char c = 0;
+    (void)read(keyboardFd, &c, 1);
+    return c;
+}
+
+typedef enum {
+    NAV_TIMEOUT,
+    NAV_QUIT,
+    NAV_TOGGLE_PAUSE,
+    NAV_BACK,
+    NAV_FORWARD,
+    NAV_FASTER,
+    NAV_SLOWER,
+} NavEvent;
+
+char readKey(const double seconds) {
+    const char key = waitKeyOrTimeout(seconds);
+    if (key != KEY_ESC) {
+        return key;
+    }
+    const char introducer = waitKeyOrTimeout(0.05);
+    if (introducer == KEY_CSI) {
+        const char final = waitKeyOrTimeout(0.05);
+        if (final == ARROW_LEFT)  return 'h';
+        if (final == ARROW_RIGHT) return 'l';
+    }
+    return 0;
+}
+
+NavEvent waitDuringWord(const double duration) {
+    double remaining = duration;
+    while (remaining > 0) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        const char key = readKey(remaining);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double elapsed = (t1.tv_sec - t0.tv_sec)
+            + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        remaining -= elapsed;
+
+        if (key == 'q' || key == 'Q') return NAV_QUIT;
+        if (key == ' ')               return NAV_TOGGLE_PAUSE;
+        if (key == '+' || key == '=') return NAV_FASTER;
+        if (key == '-')               return NAV_SLOWER;
+    }
+    return NAV_TIMEOUT;
+}
+
+NavEvent waitDuringPause(void) {
+    while (true) {
+        const char key = readKey(-1);
+        switch (key) {
+            case 'q': case 'Q':       return NAV_QUIT;
+            case ' ':                 return NAV_TOGGLE_PAUSE;
+            case 'h': case '[':       return NAV_BACK;
+            case 'l': case ']':       return NAV_FORWARD;
+            default: break;
+        }
+    }
 }
 
 void restoreTerminal(void) {
@@ -152,6 +253,18 @@ int getWordLength(const char *buffer) {
         end++;
     }
     return (int)(end - buffer);
+}
+
+char *previousWordStart(char *text, char *current) {
+    if (current <= text) return text;
+    char *p = current;
+    while (p > text && isWordSeparator(*(p - 1))) {
+        p--;
+    }
+    while (p > text && !isWordSeparator(*(p - 1))) {
+        p--;
+    }
+    return p;
 }
 
 int utf8SeqLen(const char *p) {
@@ -253,18 +366,6 @@ double secondsForWPM(const int wpm) {
     return 60.0 / wpm;
 }
 
-void sleepSeconds(const double seconds) {
-    if (seconds <= 0) {
-        return;
-    }
-    const time_t wholeSecs = (time_t)seconds;
-    const struct timespec ts = {
-        .tv_sec = wholeSecs,
-        .tv_nsec = (long)((seconds - wholeSecs) * 1e9),
-    };
-    nanosleep(&ts, NULL);
-}
-
 void installSignalHandler(const int signo, void (*handler)(int), const int flags) {
     struct sigaction sa = {0};
     sa.sa_handler = handler;
@@ -278,7 +379,8 @@ void initTerminal(void) {
     installSignalHandler(SIGINT, onSignal, 0);
     installSignalHandler(SIGTERM, onSignal, 0);
     installSignalHandler(SIGWINCH, onWindowChange, SA_RESTART);
-    disableEcho();
+    prepareTerminalInput();
+    openKeyboard();
     fputs(ENTER_ALT_SCREEN HIDE_CURSOR CLEAR_SCREEN, stdout);
 }
 
@@ -358,11 +460,15 @@ int main(const int argc, char *argv[]) {
 
     initTerminal();
 
-    const double wordDuration = secondsForWPM(options.wpm);
+    int wpm = options.wpm;
+    double wordDuration = secondsForWPM(wpm);
     const long totalBytes = (long)strlen(text);
 
     char *cursor = text;
-    while (*cursor) {
+    bool paused = false;
+    bool quit = false;
+
+    while (*cursor && !quit) {
         while (isWordSeparator(*cursor)) {
             cursor++;
         }
@@ -370,11 +476,10 @@ int main(const int argc, char *argv[]) {
             break;
         }
 
+        char *wordStart = cursor;
         const int wordLength = getWordLength(cursor);
         const bool needsExtraPause = isSentenceEnd(cursor[wordLength - 1])
             || nextIsParagraphBreak(cursor + wordLength);
-
-        const char *wordStart = cursor;
         cursor += wordLength;
 
         const int cols = currentCols();
@@ -390,7 +495,45 @@ int main(const int argc, char *argv[]) {
         printProgressBar(cursor - text, totalBytes, cols);
         fflush(stdout);
 
-        sleepSeconds(needsExtraPause ? wordDuration * EXTRA_PAUSE_FACTOR : wordDuration);
+        NavEvent event;
+        if (paused) {
+            event = waitDuringPause();
+        } else {
+            const double duration = needsExtraPause
+                ? wordDuration * EXTRA_PAUSE_FACTOR
+                : wordDuration;
+            event = waitDuringWord(duration);
+        }
+
+        switch (event) {
+            case NAV_QUIT:
+                quit = true;
+                break;
+            case NAV_TOGGLE_PAUSE:
+                paused = !paused;
+                if (paused) cursor = wordStart;
+                break;
+            case NAV_BACK:
+                cursor = previousWordStart(text, wordStart);
+                break;
+            case NAV_FASTER:
+                if (wpm + WPM_STEP <= MAX_WPM) {
+                    wpm += WPM_STEP;
+                    wordDuration = secondsForWPM(wpm);
+                }
+                cursor = wordStart;
+                break;
+            case NAV_SLOWER:
+                if (wpm - WPM_STEP >= MIN_WPM) {
+                    wpm -= WPM_STEP;
+                    wordDuration = secondsForWPM(wpm);
+                }
+                cursor = wordStart;
+                break;
+            case NAV_FORWARD:
+            case NAV_TIMEOUT:
+                break;
+        }
     }
 
     free(text);
