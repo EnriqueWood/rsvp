@@ -119,31 +119,26 @@ int utf8SeqLen(const unsigned char b) {
 
 WordMetrics measureWord(const char *buffer, const int byteLength) {
     int codePoints = 0;
-    int i = 0;
-    while (i < byteLength) {
-        i += utf8SeqLen((unsigned char)buffer[i]);
+    int byteIndex = 0;
+    while (byteIndex < byteLength) {
+        byteIndex += utf8SeqLen((unsigned char)buffer[byteIndex]);
         codePoints++;
     }
 
     const int target = codePoints / 2;
-    int byteOffset = 0;
-    int byteLen = 0;
-    int j = 0;
-    int cp = 0;
-    while (j < byteLength) {
-        int seqLen = utf8SeqLen((unsigned char)buffer[j]);
-        if (j + seqLen > byteLength) {
-            seqLen = byteLength - j;
-        }
-        if (cp == target) {
-            byteOffset = j;
-            byteLen = seqLen;
-            break;
-        }
-        j += seqLen;
-        cp++;
+    int middleOffset = 0;
+    for (int codePoint = 0; codePoint < target; codePoint++) {
+        middleOffset += utf8SeqLen((unsigned char)buffer[middleOffset]);
     }
-    return (WordMetrics){codePoints, byteOffset, byteLen};
+    const int middleLength = codePoints > 0
+        ? utf8SeqLen((unsigned char)buffer[middleOffset])
+        : 0;
+
+    return (WordMetrics){
+        .codePoints = codePoints,
+        .middleByteOffset = middleOffset,
+        .middleByteLength = middleLength,
+    };
 }
 
 int linesNeeded(const int totalChars, const int cols) {
@@ -303,11 +298,11 @@ int main(const int argc, char *argv[]) {
 
     char *cursor = text;
     int linesUsed = 1;
-    while (cursor[0] != '\0') {
-        while (isWordSeparator(cursor[0])) {
-            cursor = &cursor[1];
+    while (*cursor) {
+        while (isWordSeparator(*cursor)) {
+            cursor++;
         }
-        if (cursor[0] == '\0') {
+        if (!*cursor) {
             break;
         }
 
@@ -320,7 +315,7 @@ int main(const int argc, char *argv[]) {
         linesUsed = linesNeeded(totalChars, cols);
         fflush(stdout);
 
-        cursor = &cursor[wordLength];
+        cursor += wordLength;
         sleepSeconds(needsExtraPause ? wordDuration * EXTRA_PAUSE_FACTOR : wordDuration);
     }
 
