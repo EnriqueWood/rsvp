@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -101,15 +102,15 @@ bool isWordSeparator(const char c) {
 }
 
 int getWordLength(const char *buffer) {
-    int wordLength = 0;
-    char letter;
-    while ((letter = buffer[wordLength]) != '\0' && !isWordSeparator(letter)) {
-        wordLength++;
+    const char *end = buffer;
+    while (*end && !isWordSeparator(*end)) {
+        end++;
     }
-    return wordLength;
+    return (int)(end - buffer);
 }
 
-int utf8SeqLen(const unsigned char b) {
+int utf8SeqLen(const char *p) {
+    const unsigned char b = (unsigned char)*p;
     if ((b & 0x80) == 0x00) return 1;
     if ((b & 0xE0) == 0xC0) return 2;
     if ((b & 0xF0) == 0xE0) return 3;
@@ -121,17 +122,17 @@ WordMetrics measureWord(const char *buffer, const int byteLength) {
     int codePoints = 0;
     int byteIndex = 0;
     while (byteIndex < byteLength) {
-        byteIndex += utf8SeqLen((unsigned char)buffer[byteIndex]);
+        byteIndex += utf8SeqLen(buffer + byteIndex);
         codePoints++;
     }
 
     const int target = codePoints / 2;
     int middleOffset = 0;
     for (int codePoint = 0; codePoint < target; codePoint++) {
-        middleOffset += utf8SeqLen((unsigned char)buffer[middleOffset]);
+        middleOffset += utf8SeqLen(buffer + middleOffset);
     }
     const int middleLength = codePoints > 0
-        ? utf8SeqLen((unsigned char)buffer[middleOffset])
+        ? utf8SeqLen(buffer + middleOffset)
         : 0;
 
     return (WordMetrics){
@@ -152,6 +153,29 @@ void printSpaces(const int count) {
     for (int i = 0; i < count; i++) {
         putchar(' ');
     }
+}
+
+void printProgressBar(const long consumed, const long total, const int cols) {
+    if (total <= 0 || cols <= 0) {
+        return;
+    }
+    const int percent = (int)(100 * consumed / total);
+    const int reserved = 7;
+    if (cols < reserved + 1) {
+        printf("%3d%%", percent);
+        return;
+    }
+    const int barWidth = cols - reserved;
+    const int filled = (int)((long)barWidth * consumed / total);
+
+    putchar('[');
+    for (int i = 0; i < filled; i++) {
+        putchar('=');
+    }
+    for (int i = filled; i < barWidth; i++) {
+        putchar(' ');
+    }
+    printf("] %3d%%", percent);
 }
 
 int printWordCentered(const char *buffer, const int wordLength, const int cols) {
@@ -196,29 +220,27 @@ void sleepSeconds(const double seconds) {
     if (seconds <= 0) {
         return;
     }
-    const long ns = (long)(seconds * 1e9);
+    const time_t wholeSecs = (time_t)seconds;
     const struct timespec ts = {
-        .tv_sec = ns / 1000000000L,
-        .tv_nsec = ns % 1000000000L,
+        .tv_sec = wholeSecs,
+        .tv_nsec = (long)((seconds - wholeSecs) * 1e9),
     };
     nanosleep(&ts, NULL);
 }
 
+void installSignalHandler(const int signo, void (*handler)(int), const int flags) {
+    struct sigaction sa = {0};
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = flags;
+    sigaction(signo, &sa, NULL);
+}
+
 void initTerminal(void) {
     atexit(restoreCursor);
-
-    struct sigaction exitAction = {0};
-    exitAction.sa_handler = onSignal;
-    sigemptyset(&exitAction.sa_mask);
-    sigaction(SIGINT, &exitAction, NULL);
-    sigaction(SIGTERM, &exitAction, NULL);
-
-    struct sigaction winchAction = {0};
-    winchAction.sa_handler = onWindowChange;
-    sigemptyset(&winchAction.sa_mask);
-    winchAction.sa_flags = SA_RESTART;
-    sigaction(SIGWINCH, &winchAction, NULL);
-
+    installSignalHandler(SIGINT, onSignal, 0);
+    installSignalHandler(SIGTERM, onSignal, 0);
+    installSignalHandler(SIGWINCH, onWindowChange, SA_RESTART);
     fputs(HIDE_CURSOR, stdout);
 }
 
@@ -231,6 +253,17 @@ void cleanDisplay(const int linesUsed) {
 
 bool isSentenceEnd(const char c) {
     return c == '.' || c == '!' || c == '?';
+}
+
+bool nextIsParagraphBreak(const char *cursor) {
+    int newlines = 0;
+    while (isWordSeparator(*cursor)) {
+        if (*cursor == '\n') {
+            newlines++;
+        }
+        cursor++;
+    }
+    return newlines >= 2;
 }
 
 CliOptions parseOptions(const int argc, char **argv) {
@@ -295,6 +328,7 @@ int main(const int argc, char *argv[]) {
     initTerminal();
 
     const double wordDuration = secondsForWPM(options.wpm);
+    const long totalBytes = (long)strlen(text);
 
     char *cursor = text;
     int linesUsed = 1;
@@ -307,15 +341,20 @@ int main(const int argc, char *argv[]) {
         }
 
         const int wordLength = getWordLength(cursor);
-        const bool needsExtraPause = isSentenceEnd(cursor[wordLength - 1]);
+        const bool needsExtraPause = isSentenceEnd(cursor[wordLength - 1])
+            || nextIsParagraphBreak(cursor + wordLength);
         const int cols = currentCols();
 
         cleanDisplay(linesUsed);
         const int totalChars = printWordCentered(cursor, wordLength, cols);
-        linesUsed = linesNeeded(totalChars, cols);
-        fflush(stdout);
+        const int wordLines = linesNeeded(totalChars, cols);
 
         cursor += wordLength;
+        putchar('\n');
+        printProgressBar(cursor - text, totalBytes, cols);
+        linesUsed = wordLines + 1;
+        fflush(stdout);
+
         sleepSeconds(needsExtraPause ? wordDuration * EXTRA_PAUSE_FACTOR : wordDuration);
     }
 
